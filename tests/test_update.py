@@ -109,6 +109,30 @@ def test_dsm_check_sends_admin_centers_parameters_json_encoded():
     assert sent["need_promotion"] == "true"
 
 
+def test_installed_version_is_read_as_admin_centers_firmware_subset():
+    # Regression: SYNO.Core.System/info v1 with no type answers the whole system
+    # overview, which outran the 15 s read timeout on every call against an
+    # RS1221+ on 2026-10-29, so update_status and dsm_update_download failed at
+    # this step every time. Admin Center's Update panel asks for the firmware
+    # subset at the API's maxVersion, and so must this.
+    fake, g, p = dsm(base_routes())
+    with g, p:
+        upd().dsm_update_status()
+    (_, sent, verb), = fake.called("SYNO.Core.System", "info")
+    assert sent["version"] == "3"
+    assert sent["type"] == '"firmware"'
+    assert verb == "get"
+
+
+def test_download_reads_the_installed_version_the_same_way():
+    fake, g, p = dsm(base_routes())
+    with g, p:
+        upd().dsm_update_download()
+    calls = fake.called("SYNO.Core.System", "info")
+    assert calls
+    assert all(sent["type"] == '"firmware"' and sent["version"] == "3" for _, sent, _ in calls)
+
+
 def test_dsm_status_without_update():
     fake, g, p = dsm(base_routes(check=CHECK_NONE))
     with g, p:

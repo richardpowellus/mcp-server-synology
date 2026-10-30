@@ -9,6 +9,8 @@
 #
 # The DSM update flow, as Admin Center drives it:
 #
+#   version   SYNO.Core.System/info v3 {type: "firmware"}
+#             -> {firmware_ver, firmware_date, model}
 #   check     SYNO.Core.Upgrade.Server/check v3
 #             {user_reading, need_auto_smallupdate, need_promotion}
 #             -> data.update {available, version, reboot, restart, type,
@@ -43,6 +45,14 @@ from utils.synology_api import SynologyAPIClient
 # does not start.
 DSM_UPDATE_TARGET = "update"
 INSTALL_TYPE = "server"
+# The installed version comes from SYNO.Core.System/info exactly as Admin
+# Center's Update & Restore panel asks for it: the API's maxVersion (3 on DSM
+# 7.3) with type "firmware". Without a type, info answers the full system
+# overview, which on the RS1221+ took longer than the 15 s read timeout on
+# every call on 2026-10-29 -- so the status read, and the download that starts
+# from it, failed every time while the firmware subset answers at once.
+SYSTEM_INFO_VERSION = 3
+SYSTEM_INFO_TYPE = "firmware"
 # A download start or an install start returns once DSM has queued the work,
 # but DSM is slower to answer these than a read.
 UPDATE_WRITE_TIMEOUT = 60
@@ -106,7 +116,9 @@ class SynologyUpdate:
 
     def dsm_update_status(self) -> Dict[str, Any]:
         """Installed DSM version, the available update, and its download state."""
-        info = self._call("SYNO.Core.System", "info", 1)
+        info = self._call(
+            "SYNO.Core.System", "info", SYSTEM_INFO_VERSION, {"type": SYSTEM_INFO_TYPE}
+        )
         if not info.get("success"):
             return _failed("SYNO.Core.System/info", info)
         check = self._call(
