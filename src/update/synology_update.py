@@ -23,9 +23,13 @@
 #             (the second only when patch_info.upgradetype is "dsm")
 #   install   SYNO.Core.Upgrade/start v1 {force: true, type: "server"}
 #
-# Install refuses on exactly what Admin Center refuses on: a "hard"
-# feasibility check, a PreCheck call that failed, or a PreCheck whose
-# precheck_info.can_continue is not true. What Admin Center merely warns about
+# Install refuses on what Admin Center refuses on: a "hard" feasibility check, a
+# PreCheck call that failed, or a PreCheck whose precheck_info.can_continue is
+# not true AND carries a message (Admin Center's own condition; can_continue
+# false with no message does not block there either). It refuses two things
+# Admin Center allows: a major-version upgrade (target "promotion"), which this
+# module does not start, and basic_status.allow_upgrade false. What Admin Center
+# merely warns about
 # (a "soft" feasibility check, a PreCheck message with can_continue true, a
 # EULA) needs an explicit accept_* argument here instead of a dialog.
 
