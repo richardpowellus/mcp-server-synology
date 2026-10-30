@@ -27,6 +27,7 @@ from filestation import SynologyFileStation
 from health import SynologyHealth
 from iscsi import SynologyISCSI
 from iscsi.synology_iscsi import _uuid_list
+from taskscheduler import SynologyTaskScheduler
 from update import SynologySecurity, SynologyUpdate
 
 # DSM's login codes, decoded. One table for both call sites (`_handle_login`
@@ -126,6 +127,7 @@ class SynologyMCPServer:
         self.reverse_proxy_instances: Dict[str, SynologyReverseProxy] = {}
         self.update_instances: Dict[str, SynologyUpdate] = {}
         self.security_instances: Dict[str, SynologySecurity] = {}
+        self.task_instances: Dict[str, SynologyTaskScheduler] = {}
         # One lock per NAS key, guarding the lazy login in _resolve_base_url.
         # Created lazily and only ever touched from the event-loop thread, so
         # the dict itself needs no locking.
@@ -334,6 +336,50 @@ class SynologyMCPServer:
             "accept_warnings": {"type": "boolean", "description": "Proceed past DSM's soft warnings (its confirm dialog). Default false."},
             "accept_eula": {"type": "boolean", "description": "Accept the update's terms when DSM requires it. Default false."},
         }), self._handle_dsm_update_install)
+
+        # Task Scheduler (Control Panel > Task Scheduler) - user-defined scripts
+        self._register_tool("synology_task_list", "Read-only. Task Scheduler tasks: name, id, kind (triggered at bootup/shutdown, or scheduled), owner, enabled, the script, schedule, last run and exit status, plus whether DSM is saving task output.", TN_P({
+            "name": {"type": "string", "description": "Only the task with this exact name. Omit for all."},
+        }), self._handle_task_list)
+        self._register_tool("synology_task_set", "Create, or update by name, a user-defined script task: triggered at bootup/shutdown or on a schedule, owned by root (default) or another user. A root task re-confirms the configured account's password, as DSM's UI does. Requires confirm=true. Returns before/after read back.", TN_PR({
+            "name": {"type": "string", "description": "Task name; an existing task with this name is updated."},
+            "script": {"type": "string", "description": "Shell commands to run (max 8192 characters)."},
+            "trigger": {"type": "string", "enum": ["bootup", "shutdown", "schedule"], "description": "bootup/shutdown for a triggered task, schedule for a scheduled one. DSM cannot change a task between these in place."},
+            "owner": {"type": "string", "description": "DSM user the script runs as. Default root."},
+            "enable": {"type": "boolean", "description": "Enabled. Default true."},
+            "schedule": {"type": "object", "description": "For trigger=schedule: {repeat: daily|weekly|once, week_days: [0=Sun..6] (daily/weekly, default all), date: 'YYYY/M/D' (once), hour: 0-23, minute: 0-59}.", "properties": {
+                "repeat": {"type": "string", "enum": ["daily", "weekly", "once"]},
+                "week_days": {"type": "array", "items": {"type": "integer"}},
+                "date": {"type": "string"},
+                "hour": {"type": "integer"},
+                "minute": {"type": "integer"},
+            }},
+            "notify_mail": {"type": "string", "description": "Email DSM notifies after each run. Omit for no notification."},
+            "notify_only_on_error": {"type": "boolean", "description": "With notify_mail, only notify when the script exits non-zero."},
+            "id": {"type": "integer", "description": "Task id, only needed when several tasks share the name."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["name", "script", "trigger"]), self._handle_task_set)
+        self._register_tool("synology_task_run", "Run a Task Scheduler task now. With wait_seconds, wait up to that long (max 300) and return the run's exit status and output. Requires confirm=true.", TN_PR({
+            "name": {"type": "string", "description": "Task name."},
+            "id": {"type": "integer", "description": "Task id, only needed when several tasks share the name."},
+            "wait_seconds": {"type": "integer", "description": "Seconds to wait for the run to finish. Default 0 (return once started)."},
+            "confirm": {"type": "boolean", "description": "Must be true. The script really runs, as its owner."},
+        }, ["name"]), self._handle_task_run)
+        self._register_tool("synology_task_result", "Read-only. A task's latest run (or result_id): trigger, start/stop time, exit code, and its script output when DSM's 'Save output results' was on for that run.", TN_PR({
+            "name": {"type": "string", "description": "Task name."},
+            "id": {"type": "integer", "description": "Task id, only needed when several tasks share the name."},
+            "result_id": {"type": "integer", "description": "A specific run, as a previous result reported it. Default: the latest."},
+        }, ["name"]), self._handle_task_result)
+        self._register_tool("synology_task_delete", "Delete a Task Scheduler task. Refused while another triggered task depends on it. Requires confirm=true. Returns what was deleted.", TN_PR({
+            "name": {"type": "string", "description": "Task name."},
+            "id": {"type": "integer", "description": "Task id, only needed when several tasks share the name."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["name"]), self._handle_task_delete)
+        self._register_tool("synology_task_output_set", "Turn Task Scheduler's 'Save output results' on or off. Only runs made while it is on have output to read. Requires confirm=true. Returns before/after.", TN_PR({
+            "enable": {"type": "boolean", "description": "Save task output (true) or not (false)."},
+            "output_path": {"type": "string", "description": "Shared-folder path to save it under, e.g. 'docker/task-logs'. Required when enabling with none set; kept when omitted."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["enable"]), self._handle_task_output_set)
 
         # SAN Manager (iSCSI) - LUN and target provisioning
         self._register_tool("synology_lun_create", "Create an iSCSI LUN on a volume. Returns its uuid and lun_id. On a btrfs volume DSM provisions thin by default.", TN_PR({
@@ -723,6 +769,36 @@ class SynologyMCPServer:
 
         return self.security_instances[base_url]
 
+    def _get_tasks(self, base_url: str) -> SynologyTaskScheduler:
+        """Get or create the Task Scheduler instance for a base URL."""
+        if base_url not in self.sessions:
+            raise Exception(f"No active session for {base_url}. Please login first.")
+
+        if base_url not in self.task_instances:
+            creds = self._credentials_for(base_url)
+            self.task_instances[base_url] = SynologyTaskScheduler(
+                base_url,
+                self.sessions[base_url],
+                verify_ssl=config.verify_ssl_for(base_url),
+                syno_token=self.syno_tokens.get(base_url),
+                # Read per write, never kept on the instance: a root script task
+                # needs the password re-confirmed each time it is saved.
+                password_provider=lambda: (self._credentials_for(base_url) or {}).get("password"),
+                username=(creds or {}).get("username") or "",
+            )
+
+        return self.task_instances[base_url]
+
+    @staticmethod
+    def _credentials_for(base_url: str) -> Optional[dict]:
+        """The configured NAS entry whose base_url is `base_url`, if any."""
+        wanted = base_url.rstrip("/")
+        for name in config.get_nas_names() or [None]:
+            nas_cfg = config.get_synology_config(name)
+            if (nas_cfg.get("base_url") or "").rstrip("/") == wanted:
+                return nas_cfg
+        return None
+
     def _get_usermgr(self, base_url: str) -> SynologyUserManager:
         """Get or create UserManager instance for a base URL."""
         if base_url not in self.sessions:
@@ -800,6 +876,12 @@ class SynologyMCPServer:
             "synology_autoblock_allow_add",
             "synology_autoblock_allow_remove",
             "synology_https_redirect_set",
+            "synology_task_list",
+            "synology_task_set",
+            "synology_task_run",
+            "synology_task_result",
+            "synology_task_delete",
+            "synology_task_output_set",
         }
     )
 
@@ -854,6 +936,7 @@ class SynologyMCPServer:
             self.usermgr_instances,
             self.update_instances,
             self.security_instances,
+            self.task_instances,
         )
 
     def _get_base_url(self, arguments: dict, *, allow_login: bool = True) -> str:
@@ -1530,6 +1613,92 @@ class SynologyMCPServer:
         base_url = await self._resolve_base_url(arguments)
         security = self._get_security(base_url)
         return self._emit(await asyncio.to_thread(security.set_https_redirect, arguments["enable"]))
+
+    async def _handle_task_list(self, arguments: dict) -> list[types.TextContent]:
+        """Read-only list of Task Scheduler tasks."""
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(tasks.list_tasks, arguments.get("name")))
+
+    @staticmethod
+    def _task_target(arguments: dict) -> tuple:
+        name = arguments.get("name")
+        task_id = arguments.get("id")
+        if not isinstance(name, str) or not name.strip():
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "name must be a non-empty string."}})
+        if task_id is not None and (isinstance(task_id, bool) or not isinstance(task_id, int)):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "id must be an integer."}})
+        return name, task_id
+
+    async def _handle_task_set(self, arguments: dict) -> list[types.TextContent]:
+        """Create or update a script task. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Creating or changing a scheduled task")
+        name, task_id = self._task_target(arguments)
+        for key in ("enable", "notify_only_on_error"):
+            if key in arguments and not isinstance(arguments[key], bool):
+                raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": f"{key} must be a boolean."}})
+        owner = arguments.get("owner", "root")
+        if not isinstance(owner, str) or not owner.strip():
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "owner must be a DSM user name."}})
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(
+            tasks.set_script_task,
+            name,
+            arguments.get("script"),
+            arguments.get("trigger"),
+            owner=owner.strip(),
+            enable=arguments.get("enable", True),
+            schedule=arguments.get("schedule"),
+            notify_mail=arguments.get("notify_mail"),
+            notify_only_on_error=arguments.get("notify_only_on_error", False),
+            task_id=task_id,
+        ))
+
+    async def _handle_task_run(self, arguments: dict) -> list[types.TextContent]:
+        """Run a task now. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Running a scheduled task")
+        name, task_id = self._task_target(arguments)
+        wait = arguments.get("wait_seconds", 0)
+        if isinstance(wait, bool) or not isinstance(wait, int) or wait < 0:
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "wait_seconds must be a non-negative integer."}})
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(tasks.run_task, name, task_id, wait))
+
+    async def _handle_task_result(self, arguments: dict) -> list[types.TextContent]:
+        """Read-only: a task's latest (or named) run and its output."""
+        name, task_id = self._task_target(arguments)
+        result_id = arguments.get("result_id")
+        if result_id is not None and (isinstance(result_id, bool) or not isinstance(result_id, int)):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "result_id must be an integer."}})
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(tasks.task_result, name, task_id, result_id))
+
+    async def _handle_task_delete(self, arguments: dict) -> list[types.TextContent]:
+        """Delete a task. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Deleting a scheduled task")
+        name, task_id = self._task_target(arguments)
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(tasks.delete_task, name, task_id))
+
+    async def _handle_task_output_set(self, arguments: dict) -> list[types.TextContent]:
+        """Task Scheduler's 'Save output results'. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Changing Task Scheduler's output setting")
+        if not isinstance(arguments.get("enable"), bool):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "enable must be a boolean."}})
+        path = arguments.get("output_path")
+        if path is not None and not isinstance(path, str):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "output_path must be a string."}})
+        base_url = await self._resolve_base_url(arguments)
+        tasks = self._get_tasks(base_url)
+        return self._emit(await asyncio.to_thread(tasks.set_output_saving, arguments["enable"], path))
 
     async def _handle_dsm_update_download(self, arguments: dict) -> list[types.TextContent]:
         """Start the DSM update download. Refuses without confirm=true."""
