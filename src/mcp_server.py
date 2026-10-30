@@ -722,6 +722,7 @@ class SynologyMCPServer:
             "synology_target_delete",
             "synology_target_map_lun",
             "synology_target_unmap_lun",
+            "create_directory",
         }
     )
 

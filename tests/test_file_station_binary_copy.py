@@ -211,6 +211,40 @@ def test_create_folder_uses_json_arrays(monkeypatch):
     assert captured["params"]["force_parent"] == "true"
 
 
+def capture_create(monkeypatch):
+    fs = make_client()
+    captured = {}
+
+    def fake_request(api, version, method, **params):
+        captured.update(params=params)
+        folder = json.loads(params["folder_path"])[0]
+        name = json.loads(params["name"])[0]
+        return {"folders": [{"path": f"{folder}/{name}"}]}
+
+    monkeypatch.setattr(fs, "_make_request", fake_request)
+    return fs, captured
+
+
+def test_create_folder_nested_name_becomes_parent_path(monkeypatch):
+    # Called with name "scripts/syno_hdd_db" this used to strip the "/" and
+    # create /docker/scriptssyno_hdd_db, reporting success.
+    fs, captured = capture_create(monkeypatch)
+    result = fs.create_directory("/docker", "scripts/syno_hdd_db", force_parent=True)
+
+    assert json.loads(captured["params"]["folder_path"]) == ["/docker/scripts"]
+    assert json.loads(captured["params"]["name"]) == ["syno_hdd_db"]
+    assert captured["params"]["force_parent"] == "true"
+    assert result["full_path"] == "/docker/scripts/syno_hdd_db"
+
+
+@pytest.mark.parametrize("name", ["a//b", "../etc", "a/./b", "a\\b", "/", "a/.."])
+def test_create_folder_refuses_bad_segments(monkeypatch, name):
+    fs, captured = capture_create(monkeypatch)
+    with pytest.raises(Exception, match="Invalid directory name"):
+        fs.create_directory("/docker", name)
+    assert captured == {}
+
+
 class CopyMoveFilesystem:
     def __init__(self, *, remove_source, target_size=17, target_exists=True):
         self.remove_source = remove_source
