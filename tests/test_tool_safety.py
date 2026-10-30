@@ -82,6 +82,8 @@ READ_ONLY = {
     "synology_get_user_permissions",
     "synology_update_status",
     "synology_security_posture",
+    "synology_task_list",
+    "synology_task_result",
 }
 
 # Creates something new or makes a reversible state change; removes or
@@ -148,6 +150,10 @@ DESTRUCTIVE = {
     "synology_autoblock_allow_remove",
     "synology_https_redirect_set",
     "synology_dsm_update_install",
+    "synology_task_set",
+    "synology_task_run",
+    "synology_task_delete",
+    "synology_task_output_set",
 }
 
 FENCE = re.compile(
