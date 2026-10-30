@@ -341,7 +341,22 @@ def posture_routes():
             "c": {"id": "c", "category": "systemCheck", "severity": "warning", "status": "skip", "strId": "rule_c"},
         }}),
         ("SYNO.Core.SecurityScan.Conf", "get"): ok({"enableSchedule": True, "weekday": "6", "hour": 5, "minute": 3}),
+        ("SYNO.Core.Terminal", "get"): ok(dict(TERMINAL)),
+        ("SYNO.Core.Web.DSM", "get"): ok(dict(WEB_DSM)),
+        ("SYNO.Core.Security.AutoBlock.Rules", "list"): ok({"ip_info": [], "offset": 0, "total": 0}),
     }
+
+
+# Shapes captured from an RS1221+ on DSM 7.4.1-90080 Update 1, 2026-10-29
+# (Terminal trimmed of its cipher lists).
+TERMINAL = {"enable_ssh": True, "enable_telnet": True, "forbid_console": False, "ssh_port": 22}
+WEB_DSM = {
+    "enable_avahi": True, "enable_custom_domain": True, "enable_hsts": True, "enable_https_redirect": False,
+    "enable_max_connections": False, "enable_reuseport": False, "enable_server_header": True, "enable_spdy": True,
+    "enable_ssdp": True, "fqdn": "nas.example.com", "http_port": 5000, "https_port": 5001, "main_app": "DSM",
+    "max_connections": 4096, "max_connections_limit": {"lower": 4096, "upper": 262140}, "server_header": "nginx",
+    "support_reuseport": True,
+}
 
 
 def test_posture_summarises_every_section():
@@ -358,6 +373,175 @@ def test_posture_summarises_every_section():
     assert result["administrators"] == ["admin", "richard"]
     assert [f["id"] for f in result["security_advisor"]["findings"]] == ["a"]
     assert result["security_advisor"]["schedule"]["enabled"] is True
+
+
+def test_posture_reports_terminal_redirect_and_allow_list():
+    routes = posture_routes()
+    routes[("SYNO.Core.Security.AutoBlock.Rules", "list")] = ok({"ip_info": [{"ip": "192.168.0.5"}], "offset": 0, "total": 1})
+    fake, g, p = dsm(routes)
+    with g, p:
+        result = SynologySecurity(BASE, "sid").posture()
+    assert result["terminal"] == {"telnet_enabled": True, "ssh_enabled": True, "ssh_port": 22}
+    assert result["dsm_web"]["https_redirect"] is False
+    assert result["dsm_web"]["https_port"] == 5001
+    assert result["auto_block"]["allow_list"] == ["192.168.0.5"]
+    sent = fake.called("SYNO.Core.Security.AutoBlock.Rules", "list")[0][1]
+    assert sent["type"] == '"allow"'
+
+
+class Stateful(FakeDSM):
+    """A FakeDSM whose set/create/delete change what the next get returns."""
+
+    def __init__(self, routes, terminal=None, web=None, auto_block=None, allow=None):
+        super().__init__(routes)
+        self.terminal = dict(terminal or TERMINAL)
+        self.web = dict(web or WEB_DSM)
+        self.auto_block = dict(auto_block or {"attempts": 10, "enable": False, "expire_day": 0, "within_mins": 5})
+        self.allow = list(allow or [])
+
+    def __call__(self, url, params=None, data=None, **kwargs):
+        sent = params if params is not None else data
+        key = (sent["api"], sent["method"])
+        decoded = {k: json.loads(v) for k, v in sent.items() if k not in ("api", "method", "version", "_sid")}
+        if key == ("SYNO.Core.Terminal", "set"):
+            self.terminal.update(decoded)
+        elif key == ("SYNO.Core.Web.DSM", "set"):
+            self.web.update(decoded)
+        elif key == ("SYNO.Core.Security.AutoBlock", "set"):
+            self.auto_block.update(decoded)
+        elif key == ("SYNO.Core.Security.AutoBlock.Rules", "create"):
+            self.allow.extend(i for i in decoded["ip"] if i not in self.allow)
+        elif key == ("SYNO.Core.Security.AutoBlock.Rules", "delete"):
+            self.allow = [i for i in self.allow if i not in decoded["ip"]]
+        self.routes[("SYNO.Core.Terminal", "get")] = ok(dict(self.terminal))
+        self.routes[("SYNO.Core.Web.DSM", "get")] = ok(dict(self.web))
+        self.routes[("SYNO.Core.Security.AutoBlock", "get")] = ok(dict(self.auto_block))
+        self.routes[("SYNO.Core.Security.AutoBlock.Rules", "list")] = ok(
+            {"ip_info": [{"ip": i} for i in self.allow], "offset": 0, "total": len(self.allow)}
+        )
+        for k in [("SYNO.Core.Terminal", "set"), ("SYNO.Core.Web.DSM", "set"), ("SYNO.Core.Security.AutoBlock", "set"),
+                  ("SYNO.Core.Security.AutoBlock.Rules", "create"), ("SYNO.Core.Security.AutoBlock.Rules", "delete")]:
+            self.routes.setdefault(k, ok({}))
+        return super().__call__(url, params=params, data=data, **kwargs)
+
+
+def stateful(**kw):
+    fake = Stateful({}, **kw)
+    return fake, patch("utils.synology_api.requests.get", side_effect=fake), patch(
+        "utils.synology_api.requests.post", side_effect=fake
+    )
+
+
+def test_telnet_off_keeps_ssh_and_its_port():
+    fake, g, p = stateful()
+    with g, p:
+        result = SynologySecurity(BASE, "sid").set_terminal(enable_telnet=False)
+    assert result["success"] is True
+    assert result["before"]["telnet_enabled"] is True
+    assert result["after"] == {"telnet_enabled": False, "ssh_enabled": True, "ssh_port": 22}
+    (_, sent, how), = fake.called("SYNO.Core.Terminal", "set")
+    assert how == "post" and str(sent["version"]) == "3"
+    assert {k: sent[k] for k in ("enable_telnet", "enable_ssh", "ssh_port")} == {
+        "enable_telnet": "false", "enable_ssh": "true", "ssh_port": "22"}
+
+
+def test_terminal_read_back_mismatch_is_a_failure():
+    fake, g, p = stateful()
+    fake.routes[("SYNO.Core.Terminal", "set")] = ok({})
+    original = fake.__class__.__call__
+
+    def ignore_set(self, url, params=None, data=None, **kwargs):
+        sent = params if params is not None else data
+        if (sent["api"], sent["method"]) == ("SYNO.Core.Terminal", "set"):
+            return FakeDSM.__call__(self, url, params=params, data=data, **kwargs)
+        return original(self, url, params=params, data=data, **kwargs)
+
+    with g, p, patch.object(Stateful, "__call__", ignore_set):
+        result = SynologySecurity(BASE, "sid").set_terminal(enable_telnet=False)
+    assert result["success"] is False
+    assert result["after"]["telnet_enabled"] is True
+
+
+def test_autoblock_enable_refused_with_empty_allow_list():
+    fake, g, p = stateful()
+    with g, p:
+        result = SynologySecurity(BASE, "sid").set_auto_block(enable=True)
+    assert result["success"] is False
+    assert "allow list" in result["error"]["message"]
+    assert not fake.called("SYNO.Core.Security.AutoBlock", "set")
+
+
+def test_autoblock_enable_with_allow_list_sends_admin_centers_fields():
+    fake, g, p = stateful(allow=["192.168.0.0/22"])
+    with g, p:
+        result = SynologySecurity(BASE, "sid").set_auto_block(enable=True, attempts=10, within_minutes=5, expire_days=0)
+    assert result["success"] is True
+    assert result["after"] == {"enabled": True, "attempts": 10, "within_minutes": 5, "expire_days": 0}
+    (_, sent, how), = fake.called("SYNO.Core.Security.AutoBlock", "set")
+    assert how == "post"
+    assert {k: sent[k] for k in ("enable", "attempts", "within_mins", "expire_day")} == {
+        "enable": "true", "attempts": "10", "within_mins": "5", "expire_day": "0"}
+
+
+@pytest.mark.parametrize("bad", [{"attempts": 0}, {"within_minutes": -1}, {"expire_days": -1}, {"attempts": True}])
+def test_autoblock_rejects_out_of_range_values(bad):
+    fake, g, p = stateful(allow=["192.168.0.5"])
+    with g, p:
+        result = SynologySecurity(BASE, "sid").set_auto_block(**bad)
+    assert result["success"] is False
+    assert not fake.called("SYNO.Core.Security.AutoBlock", "set")
+
+
+def test_allow_add_sends_the_dialogs_parameters_and_reads_back():
+    fake, g, p = stateful()
+    with g, p:
+        result = SynologySecurity(BASE, "sid").add_allow_list(["192.168.0.0/22", "192.168.0.5"])
+    assert result["success"] is True
+    assert result["before"] == []
+    assert result["after"] == ["192.168.0.0/22", "192.168.0.5"]
+    assert result["not_listed_verbatim"] == []
+    (_, sent, _), = fake.called("SYNO.Core.Security.AutoBlock.Rules", "create")
+    assert json.loads(sent["ip"]) == ["192.168.0.0/22", "192.168.0.5"]
+    assert sent["type"] == '"allow"' and sent["block_days"] == "0" and sent["overwrite"] == "true"
+
+
+def test_allow_remove():
+    fake, g, p = stateful(allow=["10.0.0.1", "192.168.0.5"])
+    with g, p:
+        result = SynologySecurity(BASE, "sid").remove_allow_list(["10.0.0.1"])
+    assert result["after"] == ["192.168.0.5"]
+    assert result["not_listed_verbatim"] == []
+
+
+def test_https_redirect_sends_the_whole_setting_back_with_one_change():
+    fake, g, p = stateful()
+    with g, p:
+        result = SynologySecurity(BASE, "sid").set_https_redirect(True)
+    assert result["success"] is True and result["verified"] is True
+    assert result["before"]["https_redirect"] is False
+    assert result["after"]["https_redirect"] is True
+    (_, sent, how), = fake.called("SYNO.Core.Web.DSM", "set")
+    assert how == "post" and str(sent["version"]) == "2"
+    decoded = {k: json.loads(v) for k, v in sent.items() if k not in ("api", "method", "version", "_sid")}
+    assert decoded == {**WEB_DSM, "enable_https_redirect": True}
+
+
+def test_https_redirect_unreadable_after_restart_is_reported_unverified():
+    fake, g, p = stateful()
+    real = Stateful.__call__
+    calls = {"get": 0}
+
+    def flaky(self, url, params=None, data=None, **kwargs):
+        sent = params if params is not None else data
+        if (sent["api"], sent["method"]) == ("SYNO.Core.Web.DSM", "get"):
+            calls["get"] += 1
+            if calls["get"] == 2:
+                return _response({"success": False, "error": {"code": 119}})
+        return real(self, url, params=params, data=data, **kwargs)
+
+    with g, p, patch.object(Stateful, "__call__", flaky):
+        result = SynologySecurity(BASE, "sid").set_https_redirect(True)
+    assert result["success"] is True and result["verified"] is False
 
 
 def test_posture_reports_a_failed_section_instead_of_hiding_it():
@@ -420,6 +604,54 @@ def test_install_with_confirm_installs(server):
     with g, p:
         asyncio.run(server._dispatch_tool("synology_dsm_update_install", {"base_url": BASE, "confirm": True}))
     assert fake.called("SYNO.Core.Upgrade", "start")
+
+
+WRITE_TOOLS = [
+    ("synology_terminal_set", {"enable_telnet": False}),
+    ("synology_autoblock_set", {"enable": False}),
+    ("synology_autoblock_allow_add", {"entries": ["192.168.0.5"]}),
+    ("synology_autoblock_allow_remove", {"entries": ["192.168.0.5"]}),
+    ("synology_https_redirect_set", {"enable": True}),
+]
+
+
+def test_hardening_tools_are_registered(server):
+    names = {t.name for t in server._get_tool_definitions()}
+    assert {name for name, _ in WRITE_TOOLS} <= names
+
+
+@pytest.mark.parametrize("name,args", WRITE_TOOLS)
+@pytest.mark.parametrize("confirm", [None, False, "true"])
+def test_hardening_tools_refuse_without_boolean_confirm(server, name, args, confirm):
+    call = {"base_url": BASE, **args}
+    if confirm is not None:
+        call["confirm"] = confirm
+    fake, g, p = stateful()
+    with g, p, pytest.raises(ToolFailureError):
+        asyncio.run(server._dispatch_tool(name, call))
+    assert not fake.calls
+
+
+@pytest.mark.parametrize("name,args", [
+    ("synology_terminal_set", {}),
+    ("synology_terminal_set", {"enable_telnet": "false"}),
+    ("synology_autoblock_set", {}),
+    ("synology_autoblock_allow_add", {"entries": []}),
+    ("synology_autoblock_allow_add", {"entries": "192.168.0.5"}),
+    ("synology_https_redirect_set", {"enable": "true"}),
+])
+def test_hardening_tools_refuse_bad_arguments(server, name, args):
+    fake, g, p = stateful()
+    with g, p, pytest.raises(ToolFailureError):
+        asyncio.run(server._dispatch_tool(name, {"base_url": BASE, "confirm": True, **args}))
+    assert not fake.calls
+
+
+def test_terminal_set_through_the_server(server):
+    fake, g, p = stateful()
+    with g, p:
+        content = asyncio.run(server._dispatch_tool("synology_terminal_set", {"base_url": BASE, "confirm": True, "enable_telnet": False}))
+    assert json.loads(content[0].text)["after"]["telnet_enabled"] is False
 
 
 def test_install_refuses_undeclared_arguments(server):

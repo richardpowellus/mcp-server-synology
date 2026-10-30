@@ -301,7 +301,31 @@ class SynologyMCPServer:
         self._register_tool("synology_system_log", "Get recent system log entries for diagnosing issues", TN_P({"offset": {"type": "integer", "description": "Starting offset (default: 0)"}, "limit": {"type": "integer", "description": "Max entries to return (default: 50)"}}), self._handle_system_log)
         # Updates and security posture
         self._register_tool("synology_update_status", "Read-only. Installed DSM version, the available DSM update (version, security release, whether it reboots), its download/install state, and installed packages with updates pending plus the package auto-update policy", TN, partial(self._handle_update_call, method_name="update_status"))
-        self._register_tool("synology_security_posture", "Read-only. QuickConnect, auto-block, firewall, 2FA enforcement, admin/guest account state, administrators group members, and Security Advisor's last result and open findings", TN, self._handle_security_posture)
+        self._register_tool("synology_security_posture", "Read-only. QuickConnect, auto-block and its allow list, Telnet/SSH, DSM's HTTP-to-HTTPS redirect, firewall, 2FA enforcement, admin/guest account state, administrators group members, and Security Advisor's last result and open findings", TN, self._handle_security_posture)
+        self._register_tool("synology_terminal_set", "Turn Telnet and/or SSH on or off (Control Panel > Terminal & SNMP). Omitted settings and the SSH port are kept. Requires confirm=true. Returns before/after.", TN_P({
+            "enable_telnet": {"type": "boolean", "description": "Telnet on (true) or off (false). Omit to keep."},
+            "enable_ssh": {"type": "boolean", "description": "SSH on (true) or off (false). Omit to keep."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }), self._handle_terminal_set)
+        self._register_tool("synology_autoblock_set", "Configure auto-block (Security > Protection). Omitted settings are kept. Enabling is refused while the allow list is empty. Requires confirm=true. Returns before/after.", TN_P({
+            "enable": {"type": "boolean", "description": "Auto-block on or off. Omit to keep."},
+            "attempts": {"type": "integer", "description": "Failed login attempts that trigger a block."},
+            "within_minutes": {"type": "integer", "description": "Window, in minutes, the attempts are counted over."},
+            "expire_days": {"type": "integer", "description": "Days until a block lifts; 0 means never."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }), self._handle_autoblock_set)
+        self._register_tool("synology_autoblock_allow_add", "Add entries to the auto-block allow list, which are never blocked: an IP, a subnet as ip/mask or ip/prefix (192.168.0.0/22), or a range a~b. Requires confirm=true. Returns before/after.", TN_PR({
+            "entries": {"type": "array", "items": {"type": "string"}, "description": "IPs, subnets or ranges to allow."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["entries"]), partial(self._handle_allow_list, method_name="add_allow_list"))
+        self._register_tool("synology_autoblock_allow_remove", "Remove entries from the auto-block allow list, named exactly as synology_security_posture lists them. Requires confirm=true. Returns before/after.", TN_PR({
+            "entries": {"type": "array", "items": {"type": "string"}, "description": "Entries to remove."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["entries"]), partial(self._handle_allow_list, method_name="remove_allow_list"))
+        self._register_tool("synology_https_redirect_set", "Turn DSM's automatic HTTP-to-HTTPS redirect on or off (Login Portal > DSM). DSM restarts its web server. Requires confirm=true. Returns before/after.", TN_PR({
+            "enable": {"type": "boolean", "description": "Redirect on (true) or off (false)."},
+            "confirm": {"type": "boolean", "description": "Must be true."},
+        }, ["enable"]), self._handle_https_redirect_set)
         self._register_tool("synology_dsm_update_download", "Download the available DSM update. Installs nothing. Requires confirm=true.", TN_P({
             "confirm": {"type": "boolean", "description": "Must be true. Downloads the DSM update onto the NAS."},
         }), self._handle_dsm_update_download)
@@ -771,6 +795,11 @@ class SynologyMCPServer:
             "synology_security_posture",
             "synology_dsm_update_download",
             "synology_dsm_update_install",
+            "synology_terminal_set",
+            "synology_autoblock_set",
+            "synology_autoblock_allow_add",
+            "synology_autoblock_allow_remove",
+            "synology_https_redirect_set",
         }
     )
 
@@ -1456,6 +1485,51 @@ class SynologyMCPServer:
         base_url = await self._resolve_base_url(arguments)
         security = self._get_security(base_url)
         return self._emit(await asyncio.to_thread(security.posture))
+
+    async def _handle_terminal_set(self, arguments: dict) -> list[types.TextContent]:
+        """Telnet/SSH on or off. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Changing Telnet/SSH")
+        changes = {k: arguments[k] for k in ("enable_telnet", "enable_ssh") if k in arguments}
+        if not changes or not all(isinstance(v, bool) for v in changes.values()):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "Give enable_telnet and/or enable_ssh as booleans."}})
+        base_url = await self._resolve_base_url(arguments)
+        security = self._get_security(base_url)
+        return self._emit(await asyncio.to_thread(security.set_terminal, **changes))
+
+    async def _handle_autoblock_set(self, arguments: dict) -> list[types.TextContent]:
+        """Auto-block settings. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Changing auto-block")
+        changes = {k: arguments[k] for k in ("enable", "attempts", "within_minutes", "expire_days") if k in arguments}
+        if not changes:
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "Nothing to change."}})
+        if "enable" in changes and not isinstance(changes["enable"], bool):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "enable must be a boolean."}})
+        base_url = await self._resolve_base_url(arguments)
+        security = self._get_security(base_url)
+        return self._emit(await asyncio.to_thread(security.set_auto_block, **changes))
+
+    async def _handle_allow_list(self, arguments: dict, method_name: str) -> list[types.TextContent]:
+        """Add to or remove from the auto-block allow list. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Changing the auto-block allow list")
+        entries = arguments.get("entries")
+        if not isinstance(entries, list) or not entries or not all(isinstance(e, str) and e.strip() for e in entries):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "entries must be a non-empty list of strings."}})
+        base_url = await self._resolve_base_url(arguments)
+        security = self._get_security(base_url)
+        return self._emit(await asyncio.to_thread(getattr(security, method_name), [e.strip() for e in entries]))
+
+    async def _handle_https_redirect_set(self, arguments: dict) -> list[types.TextContent]:
+        """DSM's HTTP-to-HTTPS redirect. Refuses without confirm=true."""
+        if not self._is_confirmed(arguments):
+            raise self._refuse_unconfirmed("Changing DSM's HTTPS redirect")
+        if not isinstance(arguments.get("enable"), bool):
+            raise ToolFailureError({"success": False, "error": {"code": "invalid_argument", "message": "enable must be a boolean."}})
+        base_url = await self._resolve_base_url(arguments)
+        security = self._get_security(base_url)
+        return self._emit(await asyncio.to_thread(security.set_https_redirect, arguments["enable"]))
 
     async def _handle_dsm_update_download(self, arguments: dict) -> list[types.TextContent]:
         """Start the DSM update download. Refuses without confirm=true."""
