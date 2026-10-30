@@ -882,6 +882,7 @@ class SynologyMCPServer:
             "synology_task_result",
             "synology_task_delete",
             "synology_task_output_set",
+            "create_directory",
         }
     )
 

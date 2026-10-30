@@ -721,11 +721,20 @@ class SynologyFileStation:
         if not name or name.strip() == "":
             raise Exception("Directory name cannot be empty")
 
-        # Remove any path separators from name
-        clean_name = name.strip().replace("/", "").replace("\\", "")
-
-        if not clean_name:
-            raise Exception("Invalid directory name")
+        # A name with "/" is a nested path under folder_path ("scripts/x"). It
+        # used to have its separators stripped, so "scripts/syno_hdd_db"
+        # created "scriptssyno_hdd_db" and reported success. DSM's CreateFolder
+        # takes one leaf name, so the leading segments move onto folder_path
+        # and force_parent decides whether missing ones are created.
+        if "\\" in name:
+            raise Exception(f"Invalid directory name {name!r}: use '/' to separate nested folders")
+        segments = name.strip().strip("/").split("/")
+        if any(seg.strip() in ("", ".", "..") for seg in segments):
+            raise Exception(f"Invalid directory name {name!r}: empty, '.' or '..' path segment")
+        segments = [seg.strip() for seg in segments]
+        clean_name = segments[-1]
+        if len(segments) > 1:
+            formatted_folder_path = formatted_folder_path.rstrip("/") + "/" + "/".join(segments[:-1])
 
         # Use the exact working pattern from the user's request
         data = self._make_request(
