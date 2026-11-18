@@ -81,6 +81,23 @@ def _failed(step: str, result: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": False, "step": step, "error": result.get("error")}
 
 
+# The codes SynologyAPIClient gives a request that got no DSM result:
+# network_error (a timeout, a dropped connection, or an HTTP 4xx/5xx) and
+# unknown_error (a reply that could not be read). For a write, neither says
+# whether DSM applied it.
+_UNANSWERED = frozenset({"network_error", "unknown_error"})
+
+
+def _write_failed(step: str, result: Dict[str, Any], reread: str) -> Dict[str, Any]:
+    """A failed write, marked outcome "unknown" when DSM returned no result for it."""
+    out = _failed(step, result)
+    error = result.get("error")
+    if isinstance(error, dict) and error.get("code") in _UNANSWERED:
+        out["outcome"] = "unknown"
+        out["note"] = f"DSM returned no result for this write (no reply, an HTTP error or an unreadable reply), so it may have been applied. {reread}"
+    return out
+
+
 class SynologyUpdate:
     """DSM update and package update status, and DSM update download/install."""
 
@@ -179,9 +196,10 @@ class SynologyUpdate:
     def package_update_status(self) -> Dict[str, Any]:
         """Installed packages, which have an update pending, and the auto-update policy.
 
-        A package has an update pending when DSM reports a non-empty
-        `available_operation` for it -- the test Package Center's own
-        `_isUpgradable` applies (`upgrade`, `repair` or `forcereplaced`).
+        A package has an update pending when DSM's `available_operation` for it
+        carries one of the operations Package Center's own `_isUpgradable`
+        accepts (`upgrade`, `repair` or `forcereplaced`); other operations in
+        the same field do not count.
         """
         listing = self._call(
             "SYNO.Core.Package",
@@ -200,6 +218,10 @@ class SynologyUpdate:
         for pkg in _data(listing).get("packages") or []:
             extra = pkg.get("additional") or {}
             operations = extra.get("available_operation") or {}
+            # Package Center's own _isUpgradable: an update is pending only
+            # for the upgrade/repair/forcereplaced operations, not for any
+            # non-empty available_operation.
+            upgradable = any(op in operations for op in ("upgrade", "repair", "forcereplaced"))
             row = {
                 "id": pkg.get("id"),
                 "name": pkg.get("name"),
@@ -208,7 +230,7 @@ class SynologyUpdate:
                 "autoupdate": extra.get("autoupdate"),
             }
             installed.append(row)
-            if operations:
+            if upgradable:
                 pending.append({**row, "available_operation": operations})
         policy = _data(setting)
         return {
@@ -267,13 +289,26 @@ class SynologyUpdate:
             timeout=UPDATE_WRITE_TIMEOUT,
         )
         if not started.get("success"):
-            return _failed("SYNO.Core.Upgrade.Server.Download/start", started)
+            return _write_failed(
+                "SYNO.Core.Upgrade.Server.Download/start",
+                started,
+                "Check synology_update_status before retrying.",
+            )
         progress = self._call(
             "SYNO.Core.Upgrade.Server.Download",
             "progress",
             2,
             {"need_download_target": True},
         )
+        if not progress.get("success"):
+            # The download is already running; say so, and that its progress
+            # could not be read, rather than report success with no progress.
+            return {
+                **_failed("SYNO.Core.Upgrade.Server.Download/progress", progress),
+                "started": True,
+                "version": status["update"]["version"],
+                "note": "The download is running; its progress could not be read. Poll synology_update_status.",
+            }
         return {
             "success": True,
             "started": True,
@@ -377,7 +412,7 @@ class SynologyUpdate:
             return pre
         refusal: Optional[str] = None
         if pre["blockers"]:
-            refusal = "DSM's pre-install checks refuse this install."
+            refusal = "The pre-install checks report blockers (see precheck.blockers); this install is refused."
         elif pre["warnings"] and not accept_warnings:
             refusal = "DSM raised warnings; re-run with accept_warnings=true once they are read."
         elif pre["eula_required"] and not accept_eula:
@@ -397,7 +432,15 @@ class SynologyUpdate:
             timeout=UPDATE_WRITE_TIMEOUT,
         )
         if not started.get("success"):
-            return {**_failed("SYNO.Core.Upgrade/start", started), "precheck": pre}
+            return {
+                **_write_failed(
+                    "SYNO.Core.Upgrade/start",
+                    started,
+                    "The install may have started and the NAS may reboot; do not retry "
+                    "until synology_update_status answers and shows it did not.",
+                ),
+                "precheck": pre,
+            }
         return {
             "success": True,
             "started": True,
