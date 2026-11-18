@@ -74,6 +74,8 @@ _READ_ONLY_TOOLS = (
     "synology_get_user_permissions",
     "synology_update_status",
     "synology_security_posture",
+    "synology_task_list",
+    "synology_task_result",
 )
 
 _ADDITIVE_TOOLS = (
@@ -139,6 +141,10 @@ _DESTRUCTIVE_TOOLS = (
     "synology_autoblock_allow_remove",  # can drop the MCP host's own never-block entry
     "synology_https_redirect_set",  # replaces DSM web config and restarts its web server
     "synology_dsm_update_install",  # replaces DSM; the NAS may reboot
+    "synology_task_set",  # updates an existing task by name, replacing its script
+    "synology_task_run",  # runs an arbitrary script, as root for a root task
+    "synology_task_delete",
+    "synology_task_output_set",  # off stops later runs keeping any output
 )
 
 _CLASSIFIED = [name for name in (*_READ_ONLY_TOOLS, *_ADDITIVE_TOOLS, *_DESTRUCTIVE_TOOLS)]

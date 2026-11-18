@@ -13,8 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mcp_server import SynologyMCPServer, ToolFailureError
-from taskscheduler import SynologyTaskScheduler
-from taskscheduler import synology_tasks
+from taskscheduler import SynologyTaskScheduler, synology_tasks
 
 BASE = "https://nas.example.com"
 PASSWORD = "correct horse battery staple"
